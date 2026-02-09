@@ -1,10 +1,65 @@
-.ipynb_checkpoints/
+# =========================
+# Python
+# =========================
+__pycache__/
 *.pyc
-*.png
-*.tif
-*.jpg
-*.pth
-*.mat
-*.npy
-.DS_Store
+*.pyo
 
+# Jupyter
+.ipynb_checkpoints/
+
+# =========================
+# PyTorch / DL artifacts
+# =========================
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# numpy / matlab
+*.npy
+*.npz
+*.mat
+
+# =========================
+# Training logs & outputs
+# =========================
+logs/
+experiments/
+outputs/
+results/
+runs/
+events.out.tfevents*
+
+# =========================
+# Datasets (IMPORTANT)
+# =========================
+data/
+datasets/
+
+# =========================
+# Images (dataset images)
+# =========================
+# ⚠️ 不全局 ignore png/jpg，避免误伤论文图
+data/**/*.png
+data/**/*.jpg
+data/**/*.jpeg
+data/**/*.tif
+datasets/**/*.png
+datasets/**/*.jpg
+datasets/**/*.jpeg
+datasets/**/*.tif
+
+# =========================
+# OS / IDE
+# =========================
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# runtime
+train_run.log
+inputs/
+git/

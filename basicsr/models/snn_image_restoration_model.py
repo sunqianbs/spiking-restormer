@@ -79,6 +79,9 @@ class SNNImageCleanModel(BaseModel):
     def init_training_settings(self):
         self.net_g.train()
         train_opt = self.opt['train']
+        self.spike_log_freq = train_opt.get('spike_log_freq', 10)
+        self._spike_stat_sum = {}
+        self._spike_stat_steps = 0
 
         self.ema_decay = train_opt.get('ema_decay', 0)
         if self.ema_decay > 0:
@@ -193,6 +196,26 @@ class SNNImageCleanModel(BaseModel):
         self.optimizer_g.step()
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
+        bare_net = self.get_bare_model(self.net_g)
+        if hasattr(bare_net, 'get_spike_stats_and_reset'):
+            spike_stats = bare_net.get_spike_stats_and_reset()
+            if spike_stats:
+                self._spike_stat_steps += 1
+                for k, v in spike_stats.items():
+                    self._spike_stat_sum[k] = self._spike_stat_sum.get(k, 0.0) + float(v)
+                if current_iter % self.spike_log_freq == 0:
+                    logger = get_root_logger()
+                    avg_stats = {
+                        k: (v / max(1, self._spike_stat_steps))
+                        for k, v in self._spike_stat_sum.items()
+                    }
+                    logger.info(
+                        "[spike] " + " ".join(
+                            f"{k}={avg_stats[k]:.6f}" for k in sorted(avg_stats.keys())
+                        )
+                    )
+                    self._spike_stat_sum = {}
+                    self._spike_stat_steps = 0
 
         if self.ema_decay > 0:
             self.model_ema(decay=self.ema_decay)
@@ -229,6 +252,38 @@ class SNNImageCleanModel(BaseModel):
             self.output = pred
             self.net_g.train()
 
+    def tile_test(self, tile_size, tile_overlap=32):
+        """Tile-based inference for validation to reduce peak memory."""
+        scale = self.opt.get('scale', 1)
+        b, c, h, w = self.lq.size()
+        assert b == 1, 'Only batch size 1 is supported for tile test.'
+
+        stride = tile_size - tile_overlap
+        if stride <= 0:
+            raise ValueError(f'Invalid tile settings: tile_size={tile_size}, tile_overlap={tile_overlap}')
+
+        E = torch.zeros((b, c, h * scale, w * scale), device=self.lq.device)
+        W = torch.zeros_like(E)
+
+        h_idx_list = list(range(0, max(h - tile_size, 0) + 1, stride))
+        w_idx_list = list(range(0, max(w - tile_size, 0) + 1, stride))
+        if len(h_idx_list) == 0 or h_idx_list[-1] != h - tile_size:
+            h_idx_list.append(max(h - tile_size, 0))
+        if len(w_idx_list) == 0 or w_idx_list[-1] != w - tile_size:
+            w_idx_list.append(max(w - tile_size, 0))
+
+        for h_idx in h_idx_list:
+            for w_idx in w_idx_list:
+                in_patch = self.lq[:, :, h_idx:h_idx + tile_size, w_idx:w_idx + tile_size]
+                self.nonpad_test(in_patch)
+                out_patch = self.output
+                out_patch_mask = torch.ones_like(out_patch)
+
+                E[:, :, h_idx * scale:(h_idx + tile_size) * scale, w_idx * scale:(w_idx + tile_size) * scale].add_(out_patch)
+                W[:, :, h_idx * scale:(h_idx + tile_size) * scale, w_idx * scale:(w_idx + tile_size) * scale].add_(out_patch_mask)
+
+        self.output = E.div_(W)
+
     def dist_validation(self, dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image):
         if os.environ['LOCAL_RANK'] == '0':
             return self.nondist_validation(dataloader, current_iter, tb_logger, save_img, rgb2bgr, use_image)
@@ -246,9 +301,13 @@ class SNNImageCleanModel(BaseModel):
             }
         # pbar = tqdm(total=len(dataloader), unit='image')
 
+        tile_size = self.opt['val'].get('tile_size', 0)
+        tile_overlap = self.opt['val'].get('tile_overlap', 32)
         window_size = self.opt['val'].get('window_size', 0)
 
-        if window_size:
+        if tile_size:
+            test = partial(self.tile_test, tile_size, tile_overlap)
+        elif window_size:
             test = partial(self.pad_test, window_size)
         else:
             test = self.nonpad_test
@@ -273,6 +332,7 @@ class SNNImageCleanModel(BaseModel):
             torch.cuda.empty_cache()
 
             if save_img:
+                save_gt_interval = self.opt['val'].get('save_gt_interval', 1)
                 if self.opt['is_train']:
                     save_img_path = osp.join(self.opt['path']['visualization'],
                                              img_name,
@@ -290,7 +350,8 @@ class SNNImageCleanModel(BaseModel):
                         f'{img_name}_gt.png')
 
                 imwrite(sr_img, save_img_path)
-                imwrite(gt_img, save_gt_img_path)
+                if 'gt' in visuals and (current_iter % save_gt_interval == 0):
+                    imwrite(gt_img, save_gt_img_path)
 
             if with_metrics:
                 # calculate metrics

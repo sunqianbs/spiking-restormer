@@ -4,13 +4,13 @@
 
 
 import torch
-import math
 import torch.nn as nn
 import torch.nn.functional as F
-from pdb import set_trace as stx
 import numbers
+import math
 
 from einops import rearrange
+from spikingjelly.activation_based import monitor, neuron, surrogate
 
 
 
@@ -72,50 +72,31 @@ class LayerNorm(nn.Module):
 
 
 ##########################################################################
-## 脉冲神经元与代理梯度（用于Q/K脉冲化）
-
-class _SurrogateHeaviside(torch.autograd.Function):
-    @staticmethod
-    # ctx = forward 和 backward 之间的中转站，可以用来保存 forward 过程中需要在 backward 中使用的变量
-    # x当前膜电位距离阈值还有多远，scale 代理梯度的平滑系数
-    def forward(ctx, x, scale):
-        ctx.save_for_backward(x)
-        ctx.scale = scale
-        return (x > 0).to(x.dtype)
-
-    @staticmethod
-    # grad_output后面网络”的梯度
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_tensors
-        scale = ctx.scale
-        sig = torch.sigmoid(x * scale)
-        grad = grad_output * sig * (1 - sig) * scale
-        return grad, None
-
+## 脉冲神经元（spikingjelly实现）
 
 class SpikeLIF(nn.Module):
-    """简单LIF：u = decay*u + x；s = H(u - vth)，并用代理梯度反传"""
+    """Wrapper over spikingjelly LIFNode to keep existing call sites unchanged."""
     def __init__(self, decay=0.25, vth=0.15, surrogate_scale=10.0, reset="soft"):
         super(SpikeLIF, self).__init__()
-        self.decay = decay
-        self.vth = vth
-        self.surrogate_scale = surrogate_scale
-        self.reset = reset
-        self.u = None
+        # Approximate u_t = decay * u_{t-1} + x_t by converting decay to tau.
+        tau = 1.0 / max(1e-6, (1.0 - float(decay)))
+        v_reset = None if reset == "soft" else 0.0
+        self.node = neuron.LIFNode(
+            tau=tau,
+            decay_input=False,
+            v_threshold=float(vth),
+            v_reset=v_reset,
+            surrogate_function=surrogate.Sigmoid(alpha=float(surrogate_scale)),
+            detach_reset=False,
+            step_mode="s",
+            backend="torch",
+        )
 
     def reset_state(self):
-        self.u = None
+        self.node.reset()
 
     def forward(self, x):
-        if self.u is None or self.u.shape != x.shape or self.u.device != x.device:
-            self.u = torch.zeros_like(x)
-        self.u = self.u * self.decay + x
-        s = _SurrogateHeaviside.apply(self.u - self.vth, self.surrogate_scale)
-        if self.reset == "soft":
-            self.u = self.u - s * self.vth
-        else:
-            self.u = self.u * (1 - s)
-        return s
+        return self.node(x)
 
 
 
@@ -156,8 +137,7 @@ class Attention(nn.Module):
         spike_surrogate_scale=10.0,
         spike_reset="soft",
         spike_log=False,
-        spike_log_interval=100,
-        fr_ema_momentum=0.99
+        spike_log_interval=100
     ):
         super(Attention, self).__init__()
         self.num_heads = num_heads
@@ -169,16 +149,54 @@ class Attention(nn.Module):
         self.spike_qk = spike_qk
         self.spike_log = spike_log
         self.spike_log_interval = spike_log_interval
-        self.fr_ema_momentum = fr_ema_momentum
         self._spike_log_count = 0
+        self._stats = {
+            'attn_calls': 0,
+            'block_calls': 0,
+            'n_min_sum': 0.0,
+            'n_mean_sum': 0.0,
+            'n_p1_sum': 0.0,
+            'scale2_sum': 0.0,
+            'attn_row_max_mean_sum': 0.0,
+            'attn_out_abs_mean_sum': 0.0,
+            'xin_abs_mean_sum': 0.0,
+            'ratio_sum': 0.0,
+        }
         if self.spike_qk:
             self.q_proj = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
             self.k_proj = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+            self.v_proj = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
             self.q_bn = nn.BatchNorm2d(dim)
             self.k_bn = nn.BatchNorm2d(dim)
+            self.v_bn = nn.BatchNorm2d(dim)
             self.spike_q = SpikeLIF(decay=spike_decay, vth=spike_vth, surrogate_scale=spike_surrogate_scale, reset=spike_reset)
-            self.spike_k = SpikeLIF(decay=spike_decay, vth=spike_vth, surrogate_scale=spike_surrogate_scale, reset=spike_reset)
+            self.spike_v = SpikeLIF(decay=spike_decay, vth=spike_vth, surrogate_scale=spike_surrogate_scale, reset=spike_reset)
 
+    def add_block_stats(self, xin_abs_mean, ratio):
+        if not self.spike_log:
+            return
+        self._stats['block_calls'] += 1
+        self._stats['xin_abs_mean_sum'] += float(xin_abs_mean)
+        self._stats['ratio_sum'] += float(ratio)
+
+    def pop_stats(self):
+        attn_calls = self._stats['attn_calls']
+        block_calls = self._stats['block_calls']
+        out = {}
+        if attn_calls > 0:
+            out['n_min'] = self._stats['n_min_sum'] / attn_calls
+            out['n_mean'] = self._stats['n_mean_sum'] / attn_calls
+            out['n_p1'] = self._stats['n_p1_sum'] / attn_calls
+            out['scale2'] = self._stats['scale2_sum'] / attn_calls
+            out['attn_row_max_mean'] = self._stats['attn_row_max_mean_sum'] / attn_calls
+            out['attn_out_abs_mean'] = self._stats['attn_out_abs_mean_sum'] / attn_calls
+        if block_calls > 0:
+            out['xin_abs_mean'] = self._stats['xin_abs_mean_sum'] / block_calls
+            out['attn_ratio'] = self._stats['ratio_sum'] / block_calls
+
+        for k in self._stats:
+            self._stats[k] = 0.0 if k.endswith('_sum') else 0
+        return out
 
     def forward(self, x):
         b,c,h,w = x.shape
@@ -192,38 +210,29 @@ class Attention(nn.Module):
             q = self.spike_q(q)
             k = self.k_proj(k)
             k = self.k_bn(k)
-            k = self.spike_k(k)
+            v = self.v_proj(v)
+            v = self.v_bn(v)
+            v = self.spike_v(v)
 
         q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
 
-        q = q / torch.sqrt(q.sum(dim=-1, keepdim=True) + 1e-6)
-        k = k / torch.sqrt(k.sum(dim=-1, keepdim=True) + 1e-6)
-
         attn = (q @ k.transpose(-2, -1)) * self.temperature
-        # n = float(q.shape[3])  # N = H*W
+        n = float(q.shape[3])  # N = H*W
         # # scale1 on q @ k^T logits: scale1 = 1 / sqrt(N)
-        # scale1 = 1.0 / math.sqrt(n + 1e-6)
-        # attn = attn * scale1
-        # 强制去均值：让 Attention 有正有负，从而具备“抑制”背景的能力
-        attn = attn - 0.5*attn.mean(dim=-1, keepdim=True)
+        scale1 = 1.0 / math.sqrt(n + 1e-6)
+        attn = attn * scale1
 
         # denom before normalization (for stats)
         denom = attn.sum(dim=-1, keepdim=False)
 
-        if self.spike_log and (self._spike_log_count % self.spike_log_interval == 0):
+        if self.spike_log:
             with torch.no_grad():
-                n_min = denom.min().item()
-                n_mean = denom.mean().item()
-                n_p1 = (denom > 1.0).float().mean().item()
-
-            print(
-                "[spike] n_min={:.6f} n_p1={:.6f} n_mean={:.6f} "
-                .format(
-                    n_min, n_p1, n_mean
-                )
-            )
+                self._stats['attn_calls'] += 1
+                self._stats['n_min_sum'] += denom.min().item()
+                self._stats['n_mean_sum'] += denom.mean().item()
+                self._stats['n_p1_sum'] += (denom > 1.0).float().mean().item()
         self._spike_log_count += 1
 
         assert torch.isfinite(attn).all()
@@ -234,25 +243,18 @@ class Attention(nn.Module):
         scale2 = (c_head + 1e-6) ** -0.5
         out = out * scale2
 
-        if self.spike_log and (self._spike_log_count % self.spike_log_interval == 0):
+        if self.spike_log:
             with torch.no_grad():
-                scale2_min = scale2_mean = scale2_max = float(scale2)
-
-                attn_row_max_mean = attn.detach().max(dim=-1).values.mean().item()
-            print(
-                "[spike] scale2_min/mean/max={:.6f}/{:.6f}/{:.6f} attn_row_max_mean={:.6f}".format(
-                    scale2_min, scale2_mean, scale2_max, attn_row_max_mean
-                )
-            )
+                self._stats['scale2_sum'] += float(scale2)
+                self._stats['attn_row_max_mean_sum'] += attn.detach().max(dim=-1).values.mean().item()
         
         out = rearrange(out, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=h, w=w)
 
         out = self.project_out(out)
         assert torch.isfinite(out).all()
-        if self.spike_log and (self._spike_log_count % self.spike_log_interval == 0):
+        if self.spike_log:
             with torch.no_grad():
-                attn_out_abs_mean = out.detach().abs().mean().item()
-            print(f"[spike] attn_out_abs_mean={attn_out_abs_mean:.6f}")
+                self._stats['attn_out_abs_mean_sum'] += out.detach().abs().mean().item()
         return out
 
 
@@ -293,19 +295,14 @@ class TransformerBlock(nn.Module):
         self.ffn = FeedForward(dim, ffn_expansion_factor, bias)
 
     def forward(self, x):
-        do_log = self.attn.spike_log and (
-            self.attn._spike_log_count % self.attn.spike_log_interval == 0
-        )
         xin = self.norm1(x)
         attn_out = self.attn(xin)
-        if do_log:
+        if self.attn.spike_log:
             with torch.no_grad():
                 xin_abs = xin.detach().abs().mean().item()
                 attn_out_abs_mean = attn_out.detach().abs().mean().item()
-            print(
-                f"[spike] xin_abs_mean={xin_abs:.6f} "
-                f"ratio={attn_out_abs_mean/(xin_abs+1e-6):.6f}"
-            )
+                ratio = attn_out_abs_mean / (xin_abs + 1e-6)
+            self.attn.add_block_stats(xin_abs, ratio)
         x = x + attn_out
         x = x + self.ffn(self.norm2(x))
 
@@ -352,7 +349,7 @@ class Upsample(nn.Module):
 
 ##########################################################################
 ##---------- SNNRestormer -----------------------
-class SNNRestormer(nn.Module):
+class SpikingRestormer(nn.Module):
     def __init__(self, 
         inp_channels=3, 
         out_channels=3, 
@@ -374,9 +371,10 @@ class SNNRestormer(nn.Module):
         spike_log_interval = 100       ## spike率打印间隔
     ):
 
-        super(SNNRestormer, self).__init__()
+        super(SpikingRestormer, self).__init__()
         self.spike_T = spike_T
         self.spike_qk = spike_qk
+        self.spike_log = spike_log
 
         self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
 
@@ -413,11 +411,34 @@ class SNNRestormer(nn.Module):
         ###########################
             
         self.output = nn.Conv2d(int(dim*2**1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
+        self.spike_monitor = monitor.OutputMonitor(self, SpikeLIF) if self.spike_log else None
+
+    def get_spike_stats_and_reset(self):
+        stats = {}
+        if self.spike_monitor is not None:
+            if len(self.spike_monitor.records) > 0:
+                rates = [x.detach().float().mean().item() for x in self.spike_monitor.records]
+                stats['fr_mean'] = float(sum(rates) / len(rates))
+                stats['fr_min'] = float(min(rates))
+                stats['fr_max'] = float(max(rates))
+            self.spike_monitor.clear_recorded_data()
+
+        attn_stats = []
+        for m in self.modules():
+            if isinstance(m, Attention):
+                s = m.pop_stats()
+                if s:
+                    attn_stats.append(s)
+        if attn_stats:
+            keys = attn_stats[0].keys()
+            for k in keys:
+                stats[k] = float(sum(d[k] for d in attn_stats) / len(attn_stats))
+        return stats
 
     def reset_states(self):
         """清空所有SpikeLIF的膜电位状态"""
         for m in self.modules():
-            if hasattr(m, "reset_state"):
+            if isinstance(m, SpikeLIF):
                 m.reset_state()
 
     def _forward_impl(self, inp_img):
@@ -452,11 +473,12 @@ class SNNRestormer(nn.Module):
 
         #### For Dual-Pixel Defocus Deblurring Task ####
         if self.dual_pixel_task:
-            out_dec_level1 = out_dec_level1 + self.skip_conv(inp_enc_level1)
+            out_dec_level1 += self.skip_conv(inp_enc_level1)
             out_dec_level1 = self.output(out_dec_level1)
         ###########################
         else:
-            out_dec_level1 = self.output(out_dec_level1) + inp_img
+            out_dec_level1 = self.output(out_dec_level1)
+            out_dec_level1 += inp_img
 
 
         return out_dec_level1
@@ -466,10 +488,9 @@ class SNNRestormer(nn.Module):
         assert torch.isfinite(inp_img).all()
         if self.spike_T > 1:
             self.reset_states()
-            x_seq = inp_img.unsqueeze(0).repeat(self.spike_T, 1, 1, 1, 1)
             out_seq = []
             for t in range(self.spike_T):
-                out_t = self._forward_impl(x_seq[t])
+                out_t = self._forward_impl(inp_img)
                 out_seq.append(out_t)
             out = torch.stack(out_seq, dim=0).mean(dim=0)
             assert torch.isfinite(out).all()

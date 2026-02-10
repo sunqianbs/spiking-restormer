@@ -26,8 +26,8 @@ datasets:
     ### -------------Progressive training--------------------------
     mini_batch_sizes: [2,2,2,2,2,2]             # Batch size per gpu   
     iters: [92000,64000,48000,36000,36000,24000]
-    gt_size: 256   # Max patch size for progressive training
-    gt_sizes: [128,160,192,224,256,256]  # Patch sizes for progressive training.
+    gt_size: 88   # Max patch size for progressive training
+    gt_sizes: [88,88,88,88,88,88]  # Patch sizes for progressive training.
     ### ------------------------------------------------------------
 
     ### ------- Training on single fixed-patch size 128x128---------
@@ -50,7 +50,7 @@ datasets:
 
 # network structures
 network_g:
-  type: SNNRestormer
+  type: SpikingRestormer
   inp_channels: 3
   out_channels: 3
   dim: 48
@@ -79,10 +79,11 @@ path:
 
 # training settings
 train:
-  total_iter: 200
+  total_iter: 3000
   warmup_iter: -1 # no warm up
   use_grad_clip: true
   debug_grad: true
+  spike_log_freq: 10
 
   # Split 300k iterations into two cycles. 
   # 1st cycle: fixed 3e-4 LR for 92k iters. 
@@ -113,11 +114,14 @@ train:
 # validation settings
 val:
   window_size: 8
-  val_freq: 10
+  tile_size: 256
+  tile_overlap: 32
+  val_freq: 100
   save_img: true
+  save_gt_interval: 200
   rgb2bgr: true
   use_image: true
-  max_minibatch: 8
+  max_minibatch: 2
 
   metrics:
     psnr: # metric name, can be arbitrary
@@ -127,7 +131,7 @@ val:
 
 # logging settings
 logger:
-  print_freq: 1
+  print_freq: 10
   save_checkpoint_freq: 10
   use_tb_logger: true
   wandb:

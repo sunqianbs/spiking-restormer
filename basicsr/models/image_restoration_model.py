@@ -248,7 +248,7 @@ class ImageCleanModel(BaseModel):
             torch.cuda.empty_cache()
 
             if save_img:
-                
+                save_gt_interval = self.opt['val'].get('save_gt_interval', 1)
                 if self.opt['is_train']:
                     
                     save_img_path = osp.join(self.opt['path']['visualization'],
@@ -268,7 +268,8 @@ class ImageCleanModel(BaseModel):
                         f'{img_name}_gt.png')
                     
                 imwrite(sr_img, save_img_path)
-                imwrite(gt_img, save_gt_img_path)
+                if 'gt' in visuals and (current_iter % save_gt_interval == 0):
+                    imwrite(gt_img, save_gt_img_path)
 
             if with_metrics:
                 # calculate metrics

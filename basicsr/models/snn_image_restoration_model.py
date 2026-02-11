@@ -57,11 +57,13 @@ class SNNImageCleanModel(BaseModel):
         super(SNNImageCleanModel, self).__init__(opt)
 
         # define network
-        self.mixing_flag = self.opt['train']['mixing_augs'].get('mixup', False)
-        if self.mixing_flag:
-            mixup_beta = self.opt['train']['mixing_augs'].get('mixup_beta', 1.2)
-            use_identity = self.opt['train']['mixing_augs'].get('use_identity', False)
-            self.mixing_augmentation = Mixing_Augment(mixup_beta, use_identity, self.device)
+        self.mixing_flag = False
+        if self.is_train:
+            self.mixing_flag = self.opt['train']['mixing_augs'].get('mixup', False)
+            if self.mixing_flag:
+                mixup_beta = self.opt['train']['mixing_augs'].get('mixup_beta', 1.2)
+                use_identity = self.opt['train']['mixing_augs'].get('use_identity', False)
+                self.mixing_augmentation = Mixing_Augment(mixup_beta, use_identity, self.device)
 
         self.net_g = define_network(deepcopy(opt['network_g']))
         self.net_g = self.model_to_device(self.net_g)
@@ -176,7 +178,7 @@ class SNNImageCleanModel(BaseModel):
             for p in self.net_g.parameters():
                 if p.grad is not None:
                     params_with_grad += 1
-            global_norm_raw = torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 1.0)
+            global_norm_raw = torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 5.0)
             # compute norm after clipping for verification
             total_sq = None
             for p in self.net_g.parameters():
@@ -192,7 +194,7 @@ class SNNImageCleanModel(BaseModel):
                 f'global_norm_clipped={float(global_norm_clipped):.6f}, '
                 f'params_with_grad={params_with_grad}')
         elif self.opt['train']['use_grad_clip']:
-            torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.net_g.parameters(), 5.0)
         self.optimizer_g.step()
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
@@ -350,7 +352,11 @@ class SNNImageCleanModel(BaseModel):
                         f'{img_name}_gt.png')
 
                 imwrite(sr_img, save_img_path)
-                if 'gt' in visuals and (current_iter % save_gt_interval == 0):
+                save_gt = ('gt' in visuals) and (
+                    (not self.opt['is_train']) or
+                    (isinstance(current_iter, int) and current_iter % save_gt_interval == 0)
+                )
+                if save_gt:
                     imwrite(gt_img, save_gt_img_path)
 
             if with_metrics:

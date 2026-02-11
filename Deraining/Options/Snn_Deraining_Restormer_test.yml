@@ -1,0 +1,62 @@
+name: Snn_Deraining_Restormer_test_only_val
+model_type: SNNImageCleanModel
+scale: 1
+num_gpu: 1
+manual_seed: 100
+
+datasets:
+  val:
+    name: ValSet
+    type: Dataset_PairedImage
+    dataroot_gt: ./Deraining/Datasets/test/Rain100L/target
+    dataroot_lq: ./Deraining/Datasets/test/Rain100L/input
+    io_backend:
+      type: disk
+
+network_g:
+  type: SpikingRestormer
+  inp_channels: 3
+  out_channels: 3
+  dim: 48
+  num_blocks: [4,6,6,8]
+  num_refinement_blocks: 4
+  heads: [1,2,4,8]
+  ffn_expansion_factor: 2.66
+  bias: False
+  LayerNorm_type: WithBias
+  dual_pixel_task: False
+  spike_T: 2
+  spike_qk: true
+  spike_decay: 0.25
+  spike_vth: 0.5
+  spike_surrogate_scale: 10.0
+  spike_reset: soft
+  spike_log: false
+  spike_log_interval: 1
+
+path:
+  pretrain_network_g: /home/qian/spiking-restormer/experiments/Snn_Deraining_Restormer_dbg_fresh/models/net_g_3000.pth
+  strict_load_g: true
+  resume_state: ~
+
+val:
+  window_size: 8
+  tile_size: 256
+  tile_overlap: 32
+  save_img: true
+  rgb2bgr: true
+  use_image: true
+  max_minibatch: 2
+  metrics:
+    psnr:
+      type: calculate_psnr
+      crop_border: 0
+      test_y_channel: true
+
+logger:
+  print_freq: 10
+  save_checkpoint_freq: 10
+  use_tb_logger: false
+  wandb:
+    project: ~
+    resume_id: ~

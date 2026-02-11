@@ -64,7 +64,7 @@ network_g:
   spike_T: 2
   spike_qk: true
   spike_decay: 0.25
-  spike_vth: 0.15
+  spike_vth: 0.5
   spike_surrogate_scale: 10.0
   spike_reset: soft
   spike_log: true
@@ -85,14 +85,13 @@ train:
   debug_grad: true
   spike_log_freq: 10
 
-  # Split 300k iterations into two cycles. 
-  # 1st cycle: fixed 3e-4 LR for 92k iters. 
-  # 2nd cycle: cosine annealing (3e-4 to 1e-6) for 208k iters.
+  # Single cosine cycle over total_iter:
+  # LR decays from initial lr to eta_min.
   scheduler:
     type: CosineAnnealingRestartCyclicLR
-    periods: [92000, 208000]       
-    restart_weights: [1,1]
-    eta_mins: [0.0003,0.000001]   
+    periods: [3000]
+    restart_weights: [1]
+    eta_mins: [0.000001]
   
   mixing_augs:
     mixup: false
@@ -113,10 +112,10 @@ train:
 
 # validation settings
 val:
-  window_size: 8
-  tile_size: 256
-  tile_overlap: 32
-  val_freq: 100
+  window_size: 0
+  tile_size: 88
+  tile_overlap: 16
+  val_freq: 999999999
   save_img: true
   save_gt_interval: 200
   rgb2bgr: true

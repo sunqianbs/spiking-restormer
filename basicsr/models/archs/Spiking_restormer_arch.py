@@ -6,6 +6,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.init import trunc_normal_
 import numbers
 import math
 
@@ -133,7 +134,7 @@ class Attention(nn.Module):
         bias,
         spike_qk=False,
         spike_decay=0.25,
-        spike_vth=0.15,
+        spike_vth=0.5,
         spike_surrogate_scale=10.0,
         spike_reset="soft",
         spike_log=False,
@@ -142,6 +143,7 @@ class Attention(nn.Module):
         super(Attention, self).__init__()
         self.num_heads = num_heads
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.scale_factor = nn.Parameter(torch.tensor(1.0))
 
         self.qkv = nn.Conv2d(dim, dim*3, kernel_size=1, bias=bias)
         self.qkv_dwconv = nn.Conv2d(dim*3, dim*3, kernel_size=3, stride=1, padding=1, groups=dim*3, bias=bias)
@@ -210,6 +212,7 @@ class Attention(nn.Module):
             q = self.spike_q(q)
             k = self.k_proj(k)
             k = self.k_bn(k)
+            k = F.relu(k)                                                                                                                                                                                                                                                        
             v = self.v_proj(v)
             v = self.v_bn(v)
             v = self.spike_v(v)
@@ -217,6 +220,7 @@ class Attention(nn.Module):
         q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
         v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = k / torch.sqrt(k.pow(2).mean(dim=3, keepdim=True) + 1e-5)
 
         attn = (q @ k.transpose(-2, -1)) * self.temperature
         n = float(q.shape[3])  # N = H*W
@@ -224,20 +228,24 @@ class Attention(nn.Module):
         scale1 = 1.0 / math.sqrt(n + 1e-6)
         attn = attn * scale1
 
-        # denom before normalization (for stats)
-        denom = attn.sum(dim=-1, keepdim=False)
+        # normalize attention rows so row-sum ~ 1
+        attn = attn + 1e-6
+        denom = attn.sum(dim=-1, keepdim=True)
+        # attn = attn / torch.clamp(denom, min=1e-5)
 
         if self.spike_log:
             with torch.no_grad():
+                denom_post = attn.sum(dim=-1, keepdim=False)
                 self._stats['attn_calls'] += 1
-                self._stats['n_min_sum'] += denom.min().item()
-                self._stats['n_mean_sum'] += denom.mean().item()
-                self._stats['n_p1_sum'] += (denom > 1.0).float().mean().item()
+                self._stats['n_min_sum'] += denom_post.min().item()
+                self._stats['n_mean_sum'] += denom_post.mean().item()
+                self._stats['n_p1_sum'] += (denom_post > 1.0).float().mean().item()
         self._spike_log_count += 1
 
         assert torch.isfinite(attn).all()
 
         out = (attn @ v)
+        out = out * self.scale_factor
         c_head = float(q.shape[2])
         # scale2 on attn @ v output: scale2 = 1 / sqrt(c_head + eps)
         scale2 = (c_head + 1e-6) ** -0.5
@@ -364,7 +372,7 @@ class SpikingRestormer(nn.Module):
         spike_T = 1,                   ## 脉冲时间步数
         spike_qk = False,              ## 是否开启Q/K脉冲化
         spike_decay = 0.25,            ## LIF衰减
-        spike_vth = 0.15,              ## LIF阈值
+        spike_vth = 0.5,              ## LIF阈值
         spike_surrogate_scale = 10.0,  ## 代理梯度平滑系数
         spike_reset = "soft",          ## reset策略：soft/hard
         spike_log = False,             ## 是否打印spike率
@@ -411,7 +419,27 @@ class SpikingRestormer(nn.Module):
         ###########################
             
         self.output = nn.Conv2d(int(dim*2**1), out_channels, kernel_size=3, stride=1, padding=1, bias=bias)
+        self.apply(self._init_weights)
+        nn.init.normal_(self.output.weight, std=0.1)  # 这里的 0.1 比 0.02 大了5倍
+        if self.output.bias is not None:
+            nn.init.constant_(self.output.bias, 0.0)
         self.spike_monitor = monitor.OutputMonitor(self, SpikeLIF) if self.spike_log else None
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            trunc_normal_(m.weight, std=0.02, a=-0.04, b=0.04)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.BatchNorm2d):
+            if m.weight is not None:
+                nn.init.constant_(m.weight, 1.0)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, WithBias_LayerNorm):
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, BiasFree_LayerNorm):
+            nn.init.constant_(m.weight, 1.0)
 
     def get_spike_stats_and_reset(self):
         stats = {}
